@@ -43,10 +43,12 @@ wss.on("connection", (ws) => {
         return send(ws, { type: "error", message: "Room full (max 4)." });
       }
       clients.set(id, ws);
-      send(ws, { type: "init", id, peers: [...clients.keys()].filter(pid => pid !== id) });
+      // Notify existing peers about the newcomer
       for (const [pid, pws] of clients.entries()) {
         if (pid !== id) send(pws, { type: "peer-joined", id });
       }
+      // Send init to the newcomer with current peers
+      send(ws, { type: "init", id, peers: [...clients.keys()].filter(pid => pid !== id) });
     }
 
     if (data.type === "signal" && data.target) {

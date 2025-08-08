@@ -49,16 +49,18 @@
     </div>
     <div class="hint tiny">This site is HTTPS already, so mic/cam should work on phones. Share the URL + use the same Room name.</div>
     <div id="grid" class="grid"></div>
-    <footer class="tiny">Up to 4 people per room. Face tracking by MediaPipe — masks + silly voices auto-rotate when you speak.</footer>
+    <footer class="tiny">Up to 4 people per room. Masks + silly voices auto-rotate when you speak.</footer>
   </div>
 
-  <!-- TFJS + Face Landmarks (MediaPipe Facemesh package) -->
+  <!-- TFJS + Face Landmarks (MediaPipe Facemesh) -->
   <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-core@4.22.0/dist/tf.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-converter@4.22.0/dist/tf-converter.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-webgl@4.22.0/dist/tf-backend-webgl.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/face-landmarks-detection@1.0.6/dist/face-landmarks-detection.min.js"></script>
 
 <script>
 (() => {
+  // ---------- Polyfills & TF backend warmup ----------
   if (!CanvasRenderingContext2D.prototype.roundRect) {
     CanvasRenderingContext2D.prototype.roundRect = function(x,y,w,h,r=0){
       r = Math.min(r, w/2, h/2);
@@ -80,6 +82,7 @@
     }
   })();
 
+  // ---------- UI refs ----------
   const grid = document.getElementById('grid');
   const btnJoin = document.getElementById('join');
   const btnLeave = document.getElementById('leave');
@@ -90,7 +93,7 @@
   const inpName = document.getElementById('displayName');
   const inpRoom = document.getElementById('room');
 
-  const wsURL = location.origin.replace(/^http/, 'ws');
+  const wsURL = location.origin.replace(/^http/, 'ws'); // wss on Render
 
   if (!inpRoom.value) inpRoom.value = (location.hash.slice(1) || 'family');
   if (!inpName.value) inpName.value = 'Me';
@@ -102,6 +105,7 @@
 
   function rand(a,b){ return Math.floor(Math.random()*(b-a+1))+a; }
 
+  // ---------- Tiles ----------
   function createTile(name, isMe=false){
     const tile = document.createElement('div'); tile.className = 'tile' + (isMe ? ' me' : '');
     const v = document.createElement('video'); v.autoplay = true; v.playsInline = true; v.muted = isMe;
@@ -113,6 +117,7 @@
   }
   function removeTile(el){ if (el && el.parentNode) el.parentNode.removeChild(el); }
 
+  // ---------- VAD ----------
   function makeAnalyser(ctx, sourceNode){
     const analyser = ctx.createAnalyser(); analyser.fftSize = 1024;
     const data = new Uint8Array(analyser.fftSize); sourceNode.connect(analyser);
@@ -130,6 +135,7 @@
     })(); return state;
   }
 
+  // ---------- Masks ----------
   const MaskTypes = ['clown','glasses','mustache','viking','unicorn','pirate'];
   function pickMask(){ return MaskTypes[rand(0, MaskTypes.length-1)] }
   class MaskManager {
@@ -236,8 +242,9 @@
     }
   }
 
+  // ---------- Voices ----------
   const VoiceTypes = ['robot','chipmunk','demon','radio','alien'];
-  function pickVoice(){ return VoiceTypes[rand(0, VoiceTypes.length-1)] }
+  function pickVoice(){ return VoiceTypes[rand(0, MaskTypes.length-1)] }
   function buildVoiceChain(ctx){
     const input = ctx.createGain();
     const output = ctx.createMediaStreamDestination();
@@ -269,6 +276,7 @@
   }
   function randomizeMySillies(trigger='auto'){ if(!local.maskMgr||!local.voiceChain) return; local.maskMgr.set(pickMask()); local.voiceChain.setVoice(pickVoice()); if(local.tileEl){ const badge=local.tileEl.querySelector('.badge'); badge.textContent=(trigger==='speak'?'✨ New Sillies!':'🎲 Shuffle!'); setTimeout(()=>badge.textContent='You',1200);} }
 
+  // ---------- Local media ----------
   async function startLocal(){
     if (local.stream) return;
     local.audioCtx = new (window.AudioContext || window.webkitAudioContext)();
@@ -282,7 +290,8 @@
     local.processedAudioStream = local.voiceChain.output.stream;
     const {tile, v, c, tag} = createTile(inpName.value || 'Me', true);
     local.tileEl=tile; local.videoEl=v; local.canvasEl=c; tag.textContent=(inpName.value||'Me');
-    v.srcObject = local.stream; local.maskMgr = new MaskManager(v, c);
+    v.srcObject = local.stream; v.play().catch(()=>{});
+    local.maskMgr = new MaskManager(v, c);
     const analyserSrc = local.audioCtx.createMediaStreamSource(local.processedAudioStream);
     local.vad = makeAnalyser(local.audioCtx, analyserSrc);
     local.vad.onSpeak = () => { if (sillyMode==='auto') randomizeMySillies('speak'); };
@@ -303,6 +312,7 @@
     else if (sillyMode==='calm'){ chaosTimer=setTimeout(()=>{ randomizeMySillies('timer'); setChaosTimer(); }, rand(18000,26000)); }
   }
 
+  // ---------- WebRTC helpers ----------
   function pcConfig(){
     return {
       iceServers: [
@@ -329,7 +339,7 @@
     pc.ontrack = (ev)=>{
       let peer = peers.get(peerId);
       if(!peer){ const {tile, v, c, tag, badge} = createTile(`Guest ${peerId.slice(-4)}`, false); peer={tileEl:tile, videoEl:v, canvasEl:c, nameEl:tag, badgeEl:badge, vad:null, maskMgr:null}; peers.set(peerId, peer); }
-      const stream = ev.streams[0]; peer.videoEl.srcObject = stream;
+      const stream = ev.streams[0]; peer.videoEl.srcObject = stream; peer.videoEl.play?.().catch(()=>{});
       peer.maskMgr = new MaskManager(peer.videoEl, peer.canvasEl);
       if(local.audioCtx && stream.getAudioTracks().length){
         const peerSrc = local.audioCtx.createMediaStreamSource(stream);
@@ -345,6 +355,7 @@
     const p = peers.get(peerId); if (p) { removeTile(p.tileEl); peers.delete(peerId); }
   }
 
+  // ---------- Signaling & buttons ----------
   async function joinRoom(){
     sillyMode = selMode.value;
     await startLocal();
@@ -354,8 +365,15 @@
     ws.onmessage = async (ev) => {
       const msg = JSON.parse(ev.data);
       if (msg.type === 'error') { alert(msg.message); return; }
-      if (msg.type === 'init') { myId = msg.id; for (const pid of msg.peers) await createPeer(pid, true); }
-      if (msg.type === 'peer-joined') { await createPeer(msg.id, true); }
+      if (msg.type === 'init') {
+        myId = msg.id;
+        // As the NEW joiner, we call createPeer(..., true) for existing peers
+        for (const pid of msg.peers) await createPeer(pid, true);
+      }
+      if (msg.type === 'peer-joined') {
+        // Existing peers should createPeer(..., false) (callee) to avoid glare
+        await createPeer(msg.id, false);
+      }
       if (msg.type === 'peer-left') { dropPeer(msg.id); }
       if (msg.type === 'signal') {
         const pc = pcs.get(msg.from) || (await (async ()=>{ await createPeer(msg.from,false); return pcs.get(msg.from); })());
