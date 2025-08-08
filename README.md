@@ -5,7 +5,7 @@ Up to 4-person silly video chat: **WebRTC + face masks + goofy voices**. HTTPS +
 ## One‑click Deploy to Render
 Click the button **after** you push this repo to GitHub (update the link with your repo URL):
 
-[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/YOUR_GITHUB_USERNAME/YOUR_REPO_NAME)
+[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/mwlewis/famjam)
 
 Replace `YOUR_GITHUB_USERNAME/YOUR_REPO_NAME` with your actual repo path, then click it.
 
