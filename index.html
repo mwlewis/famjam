@@ -1,0 +1,351 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+<title>SillyFam Video Party 🎭🗣️</title>
+<style>
+  :root { --bg:#0b1020; --card:#121a33; --accent:#7df8ff; --good:#92ff8b; --warn:#ffbd6b; --bad:#ff6b8b; }
+  *{box-sizing:border-box}
+  html,body{height:100%;margin:0;background:radial-gradient(1200px 800px at 70% 10%, #16254a 0%, var(--bg) 60%);color:#e9f2ff;font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial}
+  header{display:flex;gap:.75rem;align-items:center;justify-content:center;flex-wrap:wrap;padding:12px}
+  header .brand{font-weight:700;letter-spacing:.5px}
+  .wrap{max-width:1200px;margin:0 auto;padding:10px}
+  .controls{display:flex;gap:.5rem;flex-wrap:wrap;justify-content:center}
+  .controls input, .controls button, .controls select{
+    background:#0e1730;border:1px solid #22315f;color:#e9f2ff;border-radius:10px;padding:.65rem .8rem;font-size:.95rem;outline:none
+  }
+  .controls button:hover{border-color:#3a57a0}
+  .controls .primary{background:linear-gradient(90deg,#32d7ff,#8dfd7a);color:#051024;border:none;font-weight:700}
+  .hint{opacity:.8;font-size:.9rem;text-align:center;margin-top:.35rem}
+  .grid{display:grid;gap:10px;margin:12px auto 18px;grid-template-columns: repeat(auto-fit, minmax(240px,1fr));}
+  .tile{position:relative;background:var(--card);border-radius:18px;overflow:hidden;aspect-ratio:16/10;box-shadow:0 10px 30px #0004;}
+  video{width:100%;height:100%;object-fit:cover;display:block;background:#000;transform: scaleX(-1);}
+  canvas.overlay{position:absolute;inset:0;pointer-events:none;transform: scaleX(-1);}
+  .nameTag{position:absolute;left:10px;bottom:10px;background:#0b1534cc;padding:.25rem .5rem;border-radius:12px;font-size:.85rem}
+  .badge{position:absolute;right:10px;top:10px;padding:.2rem .5rem;border-radius:999px;font-size:.75rem;background:#13204dee;border:1px solid #3851a7}
+  .me .badge{background:#163a1a;border-color:#2b8b45}
+  footer{opacity:.65;font-size:.85rem;text-align:center;padding:10px}
+  .tiny{font-size:.8rem}
+</style>
+</head>
+<body>
+  <header><div class="brand">🎭 SillyFam Video Party</div></header>
+  <div class="wrap">
+    <div class="controls">
+      <input id="displayName" placeholder="Your name (e.g., Dad)" />
+      <input id="room" placeholder="Room (e.g., family)" />
+      <button id="join" class="primary">Join Party</button>
+      <button id="leave">Leave</button>
+      <button id="shuffle">Shuffle Me Now 🤪</button>
+      <select id="sillyMode">
+        <option value="auto" selected>Auto: change on speech</option>
+        <option value="chaos">Chaos: change every 6–10s</option>
+        <option value="calm">Calm: rarely change</option>
+        <option value="off">Off</option>
+      </select>
+      <button id="mute">Mute</button>
+      <button id="camera">Camera</button>
+    </div>
+    <div class="hint tiny">This site is HTTPS already, so mic/cam should work on phones. Share the URL + use the same Room name.</div>
+    <div id="grid" class="grid"></div>
+    <footer class="tiny">Up to 4 people per room. Face tracking by MediaPipe — masks + silly voices auto-rotate when you speak.</footer>
+  </div>
+
+  <!-- TFJS + Face Landmarks (MediaPipe Facemesh package) -->
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-core@4.22.0/dist/tf.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-webgl@4.22.0/dist/tf-backend-webgl.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/face-landmarks-detection@1.0.6/dist/face-landmarks-detection.min.js"></script>
+
+<script>
+(() => {
+  const grid = document.getElementById('grid');
+  const btnJoin = document.getElementById('join');
+  const btnLeave = document.getElementById('leave');
+  const btnShuffle = document.getElementById('shuffle');
+  const selMode = document.getElementById('sillyMode');
+  const btnMute = document.getElementById('mute');
+  const btnCamera = document.getElementById('camera');
+  const inpName = document.getElementById('displayName');
+  const inpRoom = document.getElementById('room');
+
+  const wsURL = location.origin.replace(/^http/, 'ws');
+
+  if (!inpRoom.value) inpRoom.value = (location.hash.slice(1) || 'family');
+  if (!inpName.value) inpName.value = 'Me';
+
+  let myId = null, ws = null, room = null;
+  let pcs = new Map(), senders = new Map(), peers = new Map();
+  let local = { stream:null, processedAudioStream:null, audioCtx:null, voiceChain:null, maskMgr:null, tileEl:null, videoEl:null, canvasEl:null, vad:null, muted:false, camOn:true };
+  let landmarksModel = null, sillyMode = 'auto', chaosTimer = null;
+
+  function rand(a,b){ return Math.floor(Math.random()*(b-a+1))+a; }
+
+  function createTile(name, isMe=false){
+    const tile = document.createElement('div'); tile.className = 'tile' + (isMe ? ' me' : '');
+    const v = document.createElement('video'); v.autoplay = true; v.playsInline = true; v.muted = isMe;
+    const c = document.createElement('canvas'); c.className = 'overlay';
+    const tag = document.createElement('div'); tag.className = 'nameTag'; tag.textContent = name || 'Guest';
+    const badge = document.createElement('div'); badge.className = 'badge'; badge.textContent = isMe ? 'You' : 'Friend';
+    tile.appendChild(v); tile.appendChild(c); tile.appendChild(tag); tile.appendChild(badge);
+    grid.appendChild(tile); return {tile, v, c, tag, badge};
+  }
+  function removeTile(el){ if (el && el.parentNode) el.parentNode.removeChild(el); }
+
+  function makeAnalyser(ctx, sourceNode){
+    const analyser = ctx.createAnalyser(); analyser.fftSize = 1024;
+    const data = new Uint8Array(analyser.fftSize); sourceNode.connect(analyser);
+    const state = { speaking:false, tLastChange:0, onSpeak:()=>{}, onSilence:()=>{} };
+    (function loop(){
+      if (ctx.state === 'closed') return;
+      analyser.getByteTimeDomainData(data);
+      let sum = 0; for (let i=0;i<data.length;i++){ const v=(data[i]-128)/128; sum += v*v; }
+      const rms = Math.sqrt(sum/data.length);
+      const now = performance.now();
+      const speakingNow = rms > 0.03;
+      if (speakingNow && !state.speaking && now - state.tLastChange > 300) { state.speaking = true; state.tLastChange = now; state.onSpeak(); }
+      if (!speakingNow && state.speaking && now - state.tLastChange > 500) { state.speaking = false; state.tLastChange = now; state.onSilence(); }
+      requestAnimationFrame(loop);
+    })(); return state;
+  }
+
+  const MaskTypes = ['clown','glasses','mustache','viking','unicorn','pirate'];
+  function pickMask(){ return MaskTypes[rand(0, MaskTypes.length-1)] }
+  class MaskManager {
+    constructor(videoEl, canvasEl){ this.video=videoEl; this.canvas=canvasEl; this.ctx=canvasEl.getContext('2d'); this.current=pickMask(); this.running=true; this.loop(); }
+    set(mask){ this.current = mask || pickMask(); }
+    async loop(){
+      await tf.ready();
+      if (!landmarksModel) landmarksModel = await faceLandmarksDetection.load(faceLandmarksDetection.SupportedPackages.mediapipeFacemesh, { maxFaces:1, shouldLoadIrisModel:false });
+      const draw = async () => {
+        if (!this.running) return;
+        const v=this.video, c=this.canvas, ctx=this.ctx;
+        if (v.videoWidth && v.videoHeight){
+          if (c.width !== v.clientWidth || c.height !== v.clientHeight){ c.width = v.clientWidth; c.height = v.clientHeight; }
+          ctx.clearRect(0,0,c.width,c.height);
+          try{
+            const faces = await landmarksModel.estimateFaces({input:v});
+            if (faces && faces[0]){
+              const f = faces[0];
+              const pts = f.scaledMesh || f.keypoints?.map(k=>[k.x,k.y]);
+              if (pts && pts.length){
+                let minX=1e9,minY=1e9,maxX=-1e9,maxY=-1e9;
+                for (const p of pts){ minX=Math.min(minX,p[0]); maxX=Math.max(maxX,p[0]); minY=Math.min(minY,p[1]); maxY=Math.max(maxY,p[1]); }
+                const sx = c.width / v.videoWidth, sy = c.height / v.videoHeight;
+                const x=minX*sx, y=minY*sy, w=(maxX-minX)*sx, h=(maxY-minY)*sy;
+                this.drawMask(ctx, x, y, w, h);
+              }
+            }
+          }catch(e){}
+        }
+        requestAnimationFrame(draw);
+      }; draw();
+    }
+    drawMask(ctx,x,y,w,h){
+      const cx=x+w/2;
+      switch(this.current){
+        case 'clown':{
+          ctx.save();
+          ctx.beginPath(); ctx.arc(cx, y + h*0.15, w*0.6, Math.PI, 0); ctx.closePath();
+          const grad = ctx.createLinearGradient(cx-w*0.6,0,cx+w*0.6,0);
+          ['#ff6464','#ffb564','#fff564','#64ff64','#64fff5','#8a7dff'].forEach((col,i)=>grad.addColorStop(i/5,col));
+          ctx.fillStyle=grad; ctx.globalAlpha=0.9; ctx.fill(); ctx.globalAlpha=1;
+          ctx.beginPath(); ctx.fillStyle='#ff2b2b'; ctx.arc(cx, y + h*0.50, w*0.07, 0, Math.PI*2); ctx.fill();
+          ctx.globalAlpha=0.4; ctx.fillStyle='#4dbaff';
+          ctx.beginPath(); ctx.arc(cx - w*0.2, y + h*0.6, w*0.07, 0, Math.PI*2); ctx.fill();
+          ctx.beginPath(); ctx.arc(cx + w*0.2, y + h*0.6, w*0.07, 0, Math.PI*2); ctx.fill();
+          ctx.globalAlpha=1; ctx.restore(); break;
+        }
+        case 'glasses':{
+          ctx.save(); const rw=w*0.28,rh=h*0.18,gap=w*0.05;
+          ctx.fillStyle='#10141fcc'; ctx.strokeStyle='#7df8ff'; ctx.lineWidth=4;
+          ctx.beginPath(); ctx.roundRect(cx - rw - gap/2, y + h*0.32, rw, rh, 16); ctx.fill(); ctx.stroke();
+          ctx.beginPath(); ctx.roundRect(cx + gap/2, y + h*0.32, rw, rh, 16); ctx.fill(); ctx.stroke();
+          ctx.beginPath(); ctx.moveTo(cx - gap/2, y + h*0.41); ctx.lineTo(cx + gap/2, y + h*0.41); ctx.stroke();
+          ctx.globalAlpha=0.4; ctx.fillStyle='#89ffff';
+          ctx.fillRect(cx - rw - gap/2 + 6, y + h*0.34, rw*0.2, 6); ctx.fillRect(cx + gap/2 + 6, y + h*0.34, rw*0.2, 6);
+          ctx.globalAlpha=1; ctx.restore(); break;
+        }
+        case 'mustache':{
+          ctx.save(); ctx.strokeStyle='#1a0e07'; ctx.lineWidth=6; ctx.lineCap='round';
+          const my = y + h*0.66, mw = w*0.45;
+          ctx.beginPath(); ctx.moveTo(cx, my);
+          ctx.bezierCurveTo(cx - mw*0.2, my - 10, cx - mw*0.6, my + 6, cx - mw, my); ctx.stroke();
+          ctx.beginPath(); ctx.moveTo(cx, my);
+          ctx.bezierCurveTo(cx + mw*0.2, my - 10, cx + mw*0.6, my + 6, cx + mw, my); ctx.stroke();
+          ctx.restore(); break;
+        }
+        case 'viking':{
+          ctx.save();
+          ctx.fillStyle='#4a576d'; ctx.strokeStyle='#cdd7e6'; ctx.lineWidth=3;
+          const hw=w*0.55, hh=h*0.20;
+          ctx.beginPath(); ctx.roundRect(cx - hw/2, y + h*0.18, hw, hh, 12); ctx.fill(); ctx.stroke();
+          ctx.fillStyle='#f5f4f2';
+          ctx.beginPath(); ctx.moveTo(cx - hw*0.45, y + h*0.18);
+          ctx.quadraticCurveTo(cx - hw*0.75, y + h*0.02, cx - hw*0.35, y + h*0.10); ctx.closePath(); ctx.fill();
+          ctx.beginPath(); ctx.moveTo(cx + hw*0.45, y + h*0.18);
+          ctx.quadraticCurveTo(cx + hw*0.75, y + h*0.02, cx + hw*0.35, y + h*0.10); ctx.closePath(); ctx.fill();
+          ctx.fillStyle='#cdd7e6'; for (let i=-2;i<=2;i++){ ctx.beginPath(); ctx.arc(cx + i*(hw/5), y + h*0.27, 4, 0, Math.PI*2); ctx.fill(); }
+          ctx.restore(); break;
+        }
+        case 'unicorn':{
+          ctx.save(); ctx.fillStyle='#ffd7fb';
+          ctx.beginPath(); ctx.moveTo(cx, y + h*0.05); ctx.lineTo(cx - w*0.04, y + h*0.22); ctx.lineTo(cx + w*0.04, y + h*0.22); ctx.closePath(); ctx.fill();
+          ctx.strokeStyle='#ff9de5'; ctx.lineWidth=2;
+          for (let i=0;i<4;i++){ ctx.beginPath(); ctx.moveTo(cx - w*0.03 + i*6, y + h*0.09 + i*12); ctx.lineTo(cx + w*0.03 - i*6, y + h*0.09 + i*12); ctx.stroke(); }
+          ctx.globalAlpha=0.35; ctx.fillStyle='#ff8bb1';
+          ctx.beginPath(); ctx.arc(cx - w*0.22, y + h*0.62, w*0.06, 0, Math.PI*2); ctx.fill();
+          ctx.beginPath(); ctx.arc(cx + w*0.22, y + h*0.62, w*0.06, 0, Math.PI*2); ctx.fill();
+          ctx.globalAlpha=1; ctx.restore(); break;
+        }
+        case 'pirate':{
+          ctx.save();
+          ctx.fillStyle='#ff3b3b'; ctx.beginPath(); ctx.roundRect(cx - w*0.35, y + h*0.18, w*0.70, h*0.16, 10); ctx.fill();
+          ctx.beginPath(); ctx.arc(cx + w*0.3, y + h*0.24, 10, 0, Math.PI*2); ctx.fill();
+          ctx.fillStyle='#0b0b0b'; ctx.beginPath(); ctx.roundRect(cx - w*0.26, y + h*0.35, w*0.20, h*0.15, 12); ctx.fill();
+          ctx.strokeStyle='#0b0b0b'; ctx.lineWidth=5; ctx.beginPath(); ctx.moveTo(cx - w*0.26, y + h*0.42); ctx.lineTo(cx + w*0.18, y + h*0.30); ctx.stroke();
+          ctx.restore(); break;
+        }
+      }
+    }
+  }
+
+  const VoiceTypes = ['robot','chipmunk','demon','radio','alien'];
+  function pickVoice(){ return VoiceTypes[rand(0, VoiceTypes.length-1)] }
+  function buildVoiceChain(ctx){
+    const input = ctx.createGain();
+    const output = ctx.createMediaStreamDestination();
+    const preGain = ctx.createGain(); preGain.gain.value = 1.0;
+    const vibratoDelay = ctx.createDelay(0.05); vibratoDelay.delayTime.value = 0.0;
+    const vibratoLFO = ctx.createOscillator(); vibratoLFO.frequency.value = 0; const vibratoDepth = vibratoDelay.delayTime;
+    const bp = ctx.createBiquadFilter(); bp.type='bandpass'; bp.frequency.value = 1400; bp.Q.value=0.7;
+    const hp = ctx.createBiquadFilter(); hp.type='highpass'; hp.frequency.value = 120; hp.Q.value=0.707;
+    const lp = ctx.createBiquadFilter(); lp.type='lowpass'; lp.frequency.value = 8000; lp.Q.value=0.707;
+    const waveshaper = ctx.createWaveShaper();
+    function makeShaper(amount=0){ const k=amount, n=1024, curve=new Float32Array(n); for(let i=0;i<n;i++){const x=i*2/n-1; curve[i]=(1+k)*x/(1+k*Math.abs(x)); } waveshaper.curve=curve; waveshaper.oversample='4x'; }
+    makeShaper(0.5);
+    const tremoloGain = ctx.createGain(); tremoloGain.gain.value = 1.0;
+    const tremoloLFO = ctx.createOscillator(); tremoloLFO.frequency.value = 0;
+    const tremoloDepth = ctx.createGain(); tremoloDepth.gain.value = 0;
+    tremoloLFO.connect(tremoloDepth); tremoloDepth.connect(tremoloGain.gain);
+    input.connect(preGain); preGain.connect(vibratoDelay); vibratoDelay.connect(bp); bp.connect(hp); hp.connect(waveshaper); waveshaper.connect(lp); lp.connect(tremoloGain); tremoloGain.connect(output);
+    vibratoLFO.start(); tremoloLFO.start();
+    function setVoice(type){
+      switch(type){
+        case 'robot': vibratoLFO.frequency.value=0; vibratoDepth.value=0.0; bp.frequency.value=1100; bp.Q.value=4; hp.frequency.value=160; lp.frequency.value=5200; makeShaper(0.9); tremoloLFO.frequency.value=30; tremoloDepth.gain.value=0.6; break;
+        case 'chipmunk': vibratoLFO.frequency.value=6; vibratoDepth.value=0.005; bp.frequency.value=1800; bp.Q.value=1.2; hp.frequency.value=200; lp.frequency.value=8000; makeShaper(0.2); tremoloLFO.frequency.value=7; tremoloDepth.gain.value=0.15; break;
+        case 'demon': vibratoLFO.frequency.value=3; vibratoDepth.value=0.004; bp.frequency.value=600; bp.Q.value=1.2; hp.frequency.value=90; lp.frequency.value=3200; makeShaper(1.2); tremoloLFO.frequency.value=8; tremoloDepth.gain.value=0.12; break;
+        case 'radio': vibratoLFO.frequency.value=0; vibratoDepth.value=0.0; bp.frequency.value=1600; bp.Q.value=6; hp.frequency.value=300; lp.frequency.value=3000; makeShaper(0.5); tremoloLFO.frequency.value=0; tremoloDepth.gain.value=0.0; break;
+        case 'alien': vibratoLFO.frequency.value=10; vibratoDepth.value=0.006; bp.frequency.value=1400; bp.Q.value=0.9; hp.frequency.value=140; lp.frequency.value=6500; makeShaper(0.6); tremoloLFO.frequency.value=12; tremoloDepth.gain.value=0.25; break;
+      }
+    }
+    return { input, output, setVoice };
+  }
+  function randomizeMySillies(trigger='auto'){ if(!local.maskMgr||!local.voiceChain) return; local.maskMgr.set(pickMask()); local.voiceChain.setVoice(pickVoice()); if(local.tileEl){ const badge=local.tileEl.querySelector('.badge'); badge.textContent=(trigger==='speak'?'✨ New Sillies!':'🎲 Shuffle!'); setTimeout(()=>badge.textContent='You',1200);} }
+
+  async function startLocal(){
+    if (local.stream) return;
+    local.audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    local.voiceChain = buildVoiceChain(local.audioCtx);
+    local.stream = await navigator.mediaDevices.getUserMedia({ video:{ facingMode:'user' }, audio:true });
+    const src = local.audioCtx.createMediaStreamSource(local.stream);
+    src.connect(local.voiceChain.input);
+    local.processedAudioStream = local.voiceChain.output.stream;
+    const {tile, v, c, tag} = createTile(inpName.value || 'Me', true);
+    local.tileEl=tile; local.videoEl=v; local.canvasEl=c; tag.textContent=(inpName.value||'Me');
+    v.srcObject = local.stream; local.maskMgr = new MaskManager(v, c);
+    const analyserSrc = local.audioCtx.createMediaStreamSource(local.processedAudioStream);
+    local.vad = makeAnalyser(local.audioCtx, analyserSrc);
+    local.vad.onSpeak = () => { if (sillyMode==='auto') randomizeMySillies('speak'); };
+    setChaosTimer();
+  }
+  function stopLocal(){
+    if (chaosTimer) { clearTimeout(chaosTimer); chaosTimer=null; }
+    for (const tr of (local.stream?.getTracks()||[])) tr.stop();
+    local.stream=null; local.processedAudioStream=null;
+    if (local.audioCtx && local.audioCtx.state!=='closed') local.audioCtx.close();
+    local.audioCtx=null;
+    if (local.tileEl) removeTile(local.tileEl);
+    local.tileEl=local.videoEl=local.canvasEl=null; local.maskMgr=null; local.vad=null;
+  }
+  function setChaosTimer(){
+    if (chaosTimer) clearTimeout(chaosTimer);
+    if (sillyMode==='chaos'){ chaosTimer=setTimeout(()=>{ randomizeMySillies('timer'); setChaosTimer(); }, rand(6000,10000)); }
+    else if (sillyMode==='calm'){ chaosTimer=setTimeout(()=>{ randomizeMySillies('timer'); setChaosTimer(); }, rand(18000,26000)); }
+  }
+  function pcConfig(){ return { iceServers:[ {urls:'stun:stun.l.google.com:19302'}, {urls:'stun:global.stun.twilio.com:3478?transport=udp'} ] }; }
+  async function addTracksTo(pc){
+    if(!local.stream||!local.processedAudioStream) return;
+    const audioTrack = local.processedAudioStream.getAudioTracks()[0];
+    const camTrack = local.stream.getVideoTracks()[0];
+    const sA = pc.addTrack(audioTrack, local.processedAudioStream);
+    const sV = pc.addTrack(camTrack, local.stream);
+    senders.set('audio', sA); senders.set('video', sV);
+  }
+  async function createPeer(peerId, isCaller){
+    const pc = new RTCPeerConnection(pcConfig());
+    pcs.set(peerId, pc);
+    await addTracksTo(pc);
+    pc.onicecandidate = (ev)=>{ if(ev.candidate){ ws.send(JSON.stringify({type:'signal', target:peerId, data:{candidate:ev.candidate}})); } };
+    pc.ontrack = (ev)=>{
+      let peer = peers.get(peerId);
+      if(!peer){ const {tile, v, c, tag, badge} = createTile(`Guest ${peerId.slice(-4)}`, false); peer={tileEl:tile, videoEl:v, canvasEl:c, nameEl:tag, badgeEl:badge, vad:null, maskMgr:null}; peers.set(peerId, peer); }
+      const stream = ev.streams[0]; peer.videoEl.srcObject = stream;
+      peer.maskMgr = new MaskManager(peer.videoEl, peer.canvasEl);
+      if(local.audioCtx && stream.getAudioTracks().length){
+        const peerSrc = local.audioCtx.createMediaStreamSource(stream);
+        peer.vad = makeAnalyser(local.audioCtx, peerSrc);
+        peer.vad.onSpeak = () => { if (sillyMode!=='off' && peer.badgeEl){ peer.maskMgr.set(pickMask()); peer.badgeEl.textContent='Talking 🎭'; setTimeout(()=>peer.badgeEl.textContent='Friend',1000); } };
+      }
+    };
+    pc.onconnectionstatechange = () => { if (['failed','closed','disconnected'].includes(pc.connectionState)) dropPeer(peerId); };
+    if(isCaller){ const offer = await pc.createOffer(); await pc.setLocalDescription(offer); ws.send(JSON.stringify({type:'signal', target:peerId, data:{ sdp: pc.localDescription }})); }
+  }
+  function dropPeer(peerId){
+    const pc = pcs.get(peerId); if (pc) { try{ pc.close(); }catch{} pcs.delete(peerId); }
+    const p = peers.get(peerId); if (p) { removeTile(p.tileEl); peers.delete(peerId); }
+  }
+
+  async function joinRoom(){
+    sillyMode = selMode.value;
+    await startLocal();
+    ws = new WebSocket(wsURL);
+    room = (inpRoom.value || 'family').trim();
+    ws.onopen = () => { ws.send(JSON.stringify({ type:'join', room })); };
+    ws.onmessage = async (ev) => {
+      const msg = JSON.parse(ev.data);
+      if (msg.type === 'error') { alert(msg.message); return; }
+      if (msg.type === 'init') { myId = msg.id; for (const pid of msg.peers) await createPeer(pid, true); }
+      if (msg.type === 'peer-joined') { await createPeer(msg.id, true); }
+      if (msg.type === 'peer-left') { dropPeer(msg.id); }
+      if (msg.type === 'signal') {
+        const pc = pcs.get(msg.from) || (await (async ()=>{ await createPeer(msg.from,false); return pcs.get(msg.from); })());
+        if (msg.data.sdp) {
+          await pc.setRemoteDescription(new RTCSessionDescription(msg.data.sdp));
+          if (msg.data.sdp.type === 'offer') {
+            const answer = await pc.createAnswer(); await pc.setLocalDescription(answer);
+            ws.send(JSON.stringify({ type:'signal', target: msg.from, data:{ sdp: pc.localDescription } }));
+          }
+        } else if (msg.data.candidate) {
+          try { await pc.addIceCandidate(new RTCIceCandidate(msg.data.candidate)); } catch {}
+        }
+      }
+    };
+  }
+  function leaveRoom(){
+    for (const pid of [...pcs.keys()]) dropPeer(pid);
+    if (ws && ws.readyState === 'OPEN') ws.close();
+    ws = null; myId = null; room = null; stopLocal();
+  }
+
+  document.getElementById('join').onclick = async ()=>{ try{ await joinRoom(); } catch(e){ console.error(e); alert('Join failed: '+e.message); } };
+  document.getElementById('leave').onclick = ()=> leaveRoom();
+  document.getElementById('shuffle').onclick = ()=> randomizeMySillies('manual');
+  selMode.onchange = ()=>{ sillyMode = selMode.value; setChaosTimer(); };
+  btnMute.onclick = ()=>{ local.muted = !local.muted; const at = local.processedAudioStream?.getAudioTracks?.()[0]; if (at) at.enabled = !local.muted; btnMute.textContent = local.muted ? 'Unmute' : 'Mute'; };
+  btnCamera.onclick = ()=>{ local.camOn = !local.camOn; const vt = local.stream?.getVideoTracks?.()[0]; if (vt) vt.enabled = local.camOn; btnCamera.textContent = local.camOn ? 'Camera' : 'Camera (off)'; };
+  document.addEventListener('visibilitychange', ()=>{ if (document.visibilityState==='visible' && local.audioCtx) local.audioCtx.resume?.(); });
+})();
+</script>
+</body>
+</html>
