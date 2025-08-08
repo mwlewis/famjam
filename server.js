@@ -1,4 +1,4 @@
-// (unchanged) WebRTC signaling + static hosting
+// WebRTC signaling + static hosting (unchanged from v4)
 const http = require("http");
 const express = require("express");
 const path = require("path");
