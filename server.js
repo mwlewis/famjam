@@ -1,4 +1,4 @@
-// Simple WebRTC signaling server for up to 4 peers per room.
+// WebRTC signaling + static hosting (Render/HTTPS friendly)
 const http = require("http");
 const express = require("express");
 const path = require("path");
@@ -10,6 +10,9 @@ const wss = new WebSocket.Server({ server });
 const rooms = new Map(); // roomName -> Map(clientId -> ws)
 
 app.use(express.static(path.join(__dirname, "public")));
+app.get("/", (req, res) => {
+  res.sendFile(path.join(__dirname, "public", "index.html"));
+});
 
 function inRoom(room) {
   if (!rooms.has(room)) rooms.set(room, new Map());
