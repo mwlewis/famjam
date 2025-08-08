@@ -171,7 +171,8 @@
         if (pts && pts.length){
           let minX=1e9,minY=1e9,maxX=-1e9,maxY=-1e9;
           for (const p of pts){ minX=Math.min(minX,p[0]); maxX=Math.max(maxX,p[0]); minY=Math.min(minY,p[1]); maxY=Math.max(maxY,p[1]); }
-          return {minX, minY, maxX, maxY, srcW: videoEl.videoWidth, srcH: videoEl.videoHeight};
+          const nose = pts[1] || [ (minX+maxX)/2, minY + (maxY-minY)*0.55 ];
+          return {minX, minY, maxX, maxY, noseX:nose[0], noseY:nose[1], srcW: videoEl.videoWidth, srcH: videoEl.videoHeight};
         }
       }
     }catch(e){ /* fall through to MP */ }
@@ -186,7 +187,8 @@
         let minX=1e9,minY=1e9,maxX=-1e9,maxY=-1e9;
         for (const p of lm){ const x=p.x*videoEl.videoWidth, y=p.y*videoEl.videoHeight;
           minX=Math.min(minX,x); maxX=Math.max(maxX,x); minY=Math.min(minY,y); maxY=Math.max(maxY,y); }
-        resolve({minX,minY,maxX,maxY, srcW: videoEl.videoWidth, srcH: videoEl.videoHeight});
+        const nose = lm[1] ? [lm[1].x*videoEl.videoWidth, lm[1].y*videoEl.videoHeight] : [ (minX+maxX)/2, minY + (maxY-minY)*0.55 ];
+        resolve({minX,minY,maxX,maxY,noseX:nose[0],noseY:nose[1], srcW: videoEl.videoWidth, srcH: videoEl.videoHeight});
       });
       mpFaceMesh.send({ image: videoEl });
     });
@@ -198,7 +200,7 @@
   class MaskManager {
     constructor(videoEl, canvasEl){
       this.video=videoEl; this.canvas=canvasEl; this.ctx=canvasEl.getContext('2d');
-      this.current=pickMask(); this.running=true; this.lastBox=null; this.lastDraw=0;
+      this.current=pickMask(); this.running=true; this.lastBox=null; this._next=0;
       this.loop();
     }
     set(mask){ this.current = mask || pickMask(); }
@@ -212,13 +214,15 @@
             try{
               const box = await estimateFaceBox(v);
               if (box){
-                const alpha = 0.25;
                 if (!this.lastBox) this.lastBox = box;
+                const a=0.25; // smoothing
                 this.lastBox = {
-                  minX: lerp(this.lastBox.minX, box.minX, alpha),
-                  minY: lerp(this.lastBox.minY, box.minY, alpha),
-                  maxX: lerp(this.lastBox.maxX, box.maxX, alpha),
-                  maxY: lerp(this.lastBox.maxY, box.maxY, alpha),
+                  minX: lerp(this.lastBox.minX, box.minX, a),
+                  minY: lerp(this.lastBox.minY, box.minY, a),
+                  maxX: lerp(this.lastBox.maxX, box.maxX, a),
+                  maxY: lerp(this.lastBox.maxY, box.maxY, a),
+                  noseX: lerp(this.lastBox.noseX, box.noseX, a),
+                  noseY: lerp(this.lastBox.noseY, box.noseY, a),
                   srcW: box.srcW, srcH: box.srcH
                 };
               }
@@ -230,107 +234,120 @@
           if (b){
             const sx = c.width / b.srcW, sy = c.height / b.srcH;
             const x=b.minX*sx, y=b.minY*sy, w=(b.maxX-b.minX)*sx, h=(b.maxY-b.minY)*sy;
-            this.drawMask(ctx, x, y, w, h);
+            const nx = b.noseX*sx, ny = b.noseY*sy;
+            this.drawMask(ctx, x, y, w, h, nx, ny);
           }
         }
         requestAnimationFrame(draw);
       }; requestAnimationFrame(draw);
     }
-    drawMask(ctx,x,y,w,h){
-      const cx=x+w/2, cy=y+h/2;
+    drawMask(ctx,x,y,w,h,nx,ny){
+      const cx=x+w/2;
+      ctx.save(); ctx.shadowColor='#0008'; ctx.shadowBlur=8;
       switch(this.current){
         case 'bananaApe':{
-          // banana peel hat + red face
-          ctx.save();
-          ctx.fillStyle='#f6d34b'; ctx.strokeStyle='#b08a2e'; ctx.lineWidth=3;
-          ctx.beginPath(); ctx.moveTo(cx, y - h*0.05); ctx.bezierCurveTo(cx+w*0.35, y+h*0.1, cx+w*0.2, y+h*0.35, cx, y+h*0.28); ctx.bezierCurveTo(cx-w*0.2, y+h*0.35, cx-w*0.35, y+h*0.1, cx, y - h*0.05); ctx.fill(); ctx.stroke();
-          ctx.fillStyle='#ff3b3b'; ctx.globalAlpha=0.35; ctx.beginPath(); ctx.ellipse(cx, y + h*0.45, w*0.26, h*0.22, 0, 0, Math.PI*2); ctx.fill(); ctx.globalAlpha=1;
-          ctx.restore(); break;
+          // banana peel hat + peel curls + face tint
+          const top = y + h*0.05;
+          const peel = (dir)=>{
+            ctx.beginPath();
+            ctx.moveTo(cx, top);
+            ctx.bezierCurveTo(cx+dir*w*0.25, top+h*0.05, cx+dir*w*0.22, top+h*0.26, cx+dir*w*0.02, top+h*0.22);
+            ctx.bezierCurveTo(cx-dir*w*0.10, top+h*0.20, cx-dir*w*0.18, top+h*0.06, cx, top);
+            ctx.closePath();
+          };
+          const grad = ctx.createLinearGradient(cx-w*0.4, top, cx+w*0.4, top+h*0.3);
+          grad.addColorStop(0, '#ffe877'); grad.addColorStop(1, '#d8b43a');
+          ctx.fillStyle=grad; peel(+1); ctx.fill(); peel(-1); ctx.fill();
+          ctx.globalAlpha=0.35; ctx.fillStyle='#ff4e4e'; ctx.beginPath(); ctx.ellipse(cx, y + h*0.48, w*0.28, h*0.24, 0, 0, Math.PI*2); ctx.fill(); ctx.globalAlpha=1;
+          break;
         }
         case 'coffeeBird':{
-          // sunglasses + big beak + coffee steam
-          ctx.save();
-          ctx.fillStyle='#111'; ctx.beginPath(); ctx.roundRect(cx - w*0.28, y + h*0.30, w*0.22, h*0.16, 12); ctx.fill();
-          ctx.beginPath(); ctx.roundRect(cx + w*0.06, y + h*0.30, w*0.22, h*0.16, 12); ctx.fill();
-          ctx.fillStyle='#ffa737'; ctx.beginPath(); ctx.moveTo(cx+ w*0.04, y+h*0.55); ctx.quadraticCurveTo(cx+w*0.38, y+h*0.52, cx+w*0.22, y+h*0.70); ctx.quadraticCurveTo(cx+w*0.05, y+h*0.63, cx+ w*0.04, y+h*0.55); ctx.fill();
-          ctx.strokeStyle='#cfa66b'; ctx.globalAlpha=0.6; for(let i=0;i<3;i++){ ctx.beginPath(); ctx.moveTo(cx - w*0.36 + i*10, y + h*0.55); ctx.bezierCurveTo(cx - w*0.32 + i*10, y + h*0.48, cx - w*0.30 + i*10, y + h*0.40, cx - w*0.28 + i*10, y + h*0.35); ctx.stroke(); }
-          ctx.globalAlpha=1; ctx.restore(); break;
+          const g=ctx.createLinearGradient(cx-w*0.4,0,cx+w*0.4,0); g.addColorStop(0,'#141414'); g.addColorStop(1,'#2a2a2a'); ctx.fillStyle=g;
+          ctx.beginPath(); ctx.roundRect(cx - w*0.30, y + h*0.30, w*0.24, h*0.17, 14); ctx.fill();
+          ctx.beginPath(); ctx.roundRect(cx + w*0.06, y + h*0.30, w*0.24, h*0.17, 14); ctx.fill();
+          ctx.fillStyle='#ff9b2f'; ctx.beginPath(); ctx.moveTo(nx, ny+h*0.08); ctx.quadraticCurveTo(nx+w*0.36, ny+h*0.02, nx+w*0.20, ny+h*0.24); ctx.quadraticCurveTo(nx+w*0.03, ny+h*0.18, nx, ny+h*0.08); ctx.fill();
+          ctx.globalAlpha=0.65; ctx.strokeStyle='#cfa66b'; for(let i=0;i<3;i++){ ctx.beginPath(); ctx.moveTo(x - w*0.05 + i*10, y + h*0.56); ctx.bezierCurveTo(x + i*10, y + h*0.50, x + w*0.04 + i*10, y + h*0.42, x + w*0.08 + i*10, y + h*0.36); ctx.stroke(); }
+          ctx.globalAlpha=1; break;
         }
         case 'goldShark':{
-          // dorsal fin + gold sneakers at bottom
-          ctx.save();
-          ctx.fillStyle='#ffd347'; ctx.beginPath(); ctx.moveTo(cx, y - h*0.02); ctx.lineTo(cx + w*0.08, y + h*0.12); ctx.lineTo(cx - w*0.08, y + h*0.12); ctx.closePath(); ctx.fill();
-          ctx.fillStyle='#e6b500'; ctx.beginPath(); ctx.roundRect(cx - w*0.35, y + h*0.85, w*0.22, h*0.12, 8); ctx.fill();
-          ctx.beginPath(); ctx.roundRect(cx + w*0.13, y + h*0.85, w*0.22, h*0.12, 8); ctx.fill();
-          ctx.restore(); break;
+          ctx.fillStyle='#ffd347'; ctx.beginPath(); ctx.moveTo(cx, y - h*0.02); ctx.lineTo(cx + w*0.09, y + h*0.14); ctx.lineTo(cx - w*0.09, y + h*0.14); ctx.closePath(); ctx.fill();
+          const shoe = (sx)=>{ ctx.beginPath(); ctx.roundRect(sx, y + h*0.86, w*0.22, h*0.1, 8); ctx.fillStyle='#f3c12c'; ctx.fill(); ctx.strokeStyle='#a98300'; ctx.stroke(); };
+          shoe(cx - w*0.30); shoe(cx + w*0.08);
+          break;
         }
         case 'hotdogSlugger':{
-          // hotdog body + tiny bat
-          ctx.save();
-          ctx.fillStyle='#f39b42'; ctx.beginPath(); ctx.roundRect(cx - w*0.13, y + h*0.30, w*0.26, h*0.45, 20); ctx.fill();
-          ctx.fillStyle='#b92d2d'; ctx.fillRect(cx - 3, y + h*0.35, 6, h*0.35);
-          ctx.strokeStyle='#a5733a'; ctx.lineWidth=6; ctx.beginPath(); ctx.moveTo(cx - w*0.36, y + h*0.65); ctx.lineTo(cx - w*0.18, y + h*0.70); ctx.stroke();
-          ctx.restore(); break;
+          ctx.fillStyle='#f7a654'; ctx.beginPath(); ctx.roundRect(cx - w*0.14, y + h*0.28, w*0.28, h*0.50, 22); ctx.fill();
+          ctx.fillStyle='#d97c2c'; ctx.beginPath(); ctx.roundRect(cx - w*0.18, y + h*0.30, w*0.08, h*0.46, 18); ctx.fill();
+          ctx.beginPath(); ctx.roundRect(cx + w*0.10, y + h*0.30, w*0.08, h*0.46, 18); ctx.fill();
+          ctx.strokeStyle='#f0d21a'; ctx.lineWidth=6; ctx.beginPath(); ctx.moveTo(cx - w*0.08, y + h*0.35); ctx.bezierCurveTo(cx, y+h*0.45, cx - w*0.04, y+h*0.60, cx + w*0.02, y+h*0.70); ctx.stroke();
+          ctx.strokeStyle='#a5733a'; ctx.lineWidth=6; ctx.beginPath(); ctx.moveTo(cx - w*0.36, y + h*0.68); ctx.lineTo(cx - w*0.18, y + h*0.73); ctx.stroke();
+          break;
         }
         case 'elephantSandals':{
-          // trunk mustache + red sandals under chin + tiny clock
-          ctx.save();
           ctx.strokeStyle='#7dbb7c'; ctx.lineWidth=10; ctx.lineCap='round';
-          ctx.beginPath(); ctx.moveTo(cx - w*0.05, y + h*0.60); ctx.bezierCurveTo(cx - w*0.18, y + h*0.74, cx - w*0.10, y + h*0.78, cx - w*0.22, y + h*0.84); ctx.stroke();
-          ctx.beginPath(); ctx.moveTo(cx + w*0.05, y + h*0.60); ctx.bezierCurveTo(cx + w*0.18, y + h*0.74, cx + w*0.10, y + h*0.78, cx + w*0.22, y + h*0.84); ctx.stroke();
+          ctx.beginPath(); ctx.moveTo(nx - w*0.04, ny + h*0.08); ctx.bezierCurveTo(nx - w*0.20, ny + h*0.18, nx - w*0.12, ny + h*0.28, nx - w*0.26, ny + h*0.34); ctx.stroke();
+          ctx.beginPath(); ctx.moveTo(nx + w*0.04, ny + h*0.08); ctx.bezierCurveTo(nx + w*0.20, ny + h*0.18, nx + w*0.12, ny + h*0.28, nx + w*0.26, ny + h*0.34); ctx.stroke();
           ctx.fillStyle='#ff5c5c'; ctx.beginPath(); ctx.roundRect(cx - w*0.28, y + h*0.86, w*0.2, h*0.08, 6); ctx.fill();
           ctx.beginPath(); ctx.roundRect(cx + w*0.08, y + h*0.86, w*0.2, h*0.08, 6); ctx.fill();
           ctx.strokeStyle='#c9c3a2'; ctx.lineWidth=3; ctx.beginPath(); ctx.arc(cx + w*0.34, y + h*0.52, 10, 0, Math.PI*2); ctx.stroke();
           ctx.beginPath(); ctx.moveTo(cx + w*0.34, y + h*0.52); ctx.lineTo(cx + w*0.34, y + h*0.47); ctx.moveTo(cx + w*0.34, y + h*0.52); ctx.lineTo(cx + w*0.39, y + h*0.52); ctx.stroke();
-          ctx.restore(); break;
+          break;
         }
         case 'tireFrog':{
-          // tire collar + froggy eyes
-          ctx.save();
           ctx.strokeStyle='#0b0b0b'; ctx.lineWidth=10;
           ctx.beginPath(); ctx.ellipse(cx, y + h*0.52, w*0.38, h*0.28, 0, 0, Math.PI*2); ctx.stroke();
+          // tread dashes
+          ctx.lineWidth=3; for(let i=-8;i<=8;i++){ ctx.beginPath(); ctx.moveTo(cx + i*w*0.04, y + h*0.40); ctx.lineTo(cx + i*w*0.04, y + h*0.64); ctx.stroke(); }
           ctx.fillStyle='#6bd178'; ctx.beginPath(); ctx.arc(cx - w*0.18, y + h*0.22, w*0.06, 0, Math.PI*2); ctx.fill();
           ctx.beginPath(); ctx.arc(cx + w*0.18, y + h*0.22, w*0.06, 0, Math.PI*2); ctx.fill();
           ctx.fillStyle='#0b0b0b'; ctx.beginPath(); ctx.arc(cx - w*0.18, y + h*0.22, w*0.025, 0, Math.PI*2); ctx.fill();
           ctx.beginPath(); ctx.arc(cx + w*0.18, y + h*0.22, w*0.025, 0, Math.PI*2); ctx.fill();
-          ctx.restore(); break;
+          break;
         }
       }
+      ctx.restore();
     }
   }
 
   // ---------- Voices ----------
-  const VoiceTypes = ['robot','chipmunk','demon','radio','alien'];
+  const VoiceTypes = ['chipmunk','giant','robot','alien','radio','monster'];
   function pickVoiceType(){ return VoiceTypes[rand(0, VoiceTypes.length-1)] }
-  function buildVoiceChain(ctx){
+
+  async function buildVoiceChain(ctx){
+    await ctx.audioWorklet.addModule('worklets/pitch-shifter.js');
     const input = ctx.createGain();
     const output = ctx.createMediaStreamDestination();
-    const preGain = ctx.createGain(); preGain.gain.value = 1.0;
-    const vibratoDelay = ctx.createDelay(0.05); vibratoDelay.delayTime.value = 0.0;
-    const vibratoLFO = ctx.createOscillator(); vibratoLFO.frequency.value = 0; const vibratoDepth = vibratoDelay.delayTime;
-    const bp = ctx.createBiquadFilter(); bp.type='bandpass'; bp.frequency.value = 1400; bp.Q.value=0.7;
-    const hp = ctx.createBiquadFilter(); hp.type='highpass'; hp.frequency.value = 120; hp.Q.value=0.707;
-    const lp = ctx.createBiquadFilter(); lp.type='lowpass'; lp.frequency.value = 8000; lp.Q.value=0.707;
-    const waveshaper = ctx.createWaveShaper();
-    function makeShaper(amount=0){ const k=amount, n=1024, curve=new Float32Array(n); for(let i=0;i<n;i++){const x=i*2/n-1; curve[i]=(1+k)*x/(1+k*Math.abs(x)); } waveshaper.curve=curve; waveshaper.oversample='4x'; }
-    makeShaper(0.5);
-    const tremoloGain = ctx.createGain(); tremoloGain.gain.value = 1.0;
-    const tremoloLFO = ctx.createOscillator(); tremoloLFO.frequency.value = 0;
-    const tremoloDepth = ctx.createGain(); tremoloDepth.gain.value = 0;
-    tremoloLFO.connect(tremoloDepth); tremoloDepth.connect(tremoloGain.gain);
-    input.connect(preGain); preGain.connect(vibratoDelay); vibratoDelay.connect(bp); bp.connect(hp); hp.connect(waveshaper); waveshaper.connect(lp); lp.connect(tremoloGain); tremoloGain.connect(output);
-    vibratoLFO.start(); tremoloLFO.start();
+    const pre = ctx.createGain(); pre.gain.value = 1.0;
+
+    const shifter = new AudioWorkletNode(ctx, 'pitch-shifter-processor', { parameterData: { pitch: 1.0, mix: 1.0 } });
+    const hp = ctx.createBiquadFilter(); hp.type='highpass'; hp.frequency.value=120;
+    const bp = ctx.createBiquadFilter(); bp.type='bandpass'; bp.frequency.value=1400; bp.Q.value=0.9;
+    const lp = ctx.createBiquadFilter(); lp.type='lowpass'; lp.frequency.value=8000;
+    const crush = ctx.createWaveShaper(); // faux bitcrush
+    function makeCrusher(bits=8){
+      const n = 1<<bits; const curve = new Float32Array(65536);
+      for(let i=0;i<curve.length;i++){ const x = i/32768-1; curve[i] = Math.round(x*n)/n; }
+      crush.curve = curve; crush.oversample='none';
+    }
+    makeCrusher(8);
+    const trem = ctx.createGain(); trem.gain.value=1.0;
+    const tremLFO = ctx.createOscillator(); tremLFO.frequency.value=0; const tremDepth = ctx.createGain(); tremDepth.gain.value=0; tremLFO.connect(tremDepth); tremDepth.connect(trem.gain); tremLFO.start();
+
+    input.connect(pre); pre.connect(shifter); shifter.connect(hp); hp.connect(bp); bp.connect(lp); lp.connect(crush); crush.connect(trem); trem.connect(output);
+
     function setVoice(type){
       switch(type){
-        case 'robot': vibratoLFO.frequency.value=0; vibratoDepth.value=0.0; bp.frequency.value=1100; bp.Q.value=4; hp.frequency.value=160; lp.frequency.value=5200; makeShaper(0.9); tremoloLFO.frequency.value=30; tremoloDepth.gain.value=0.6; break;
-        case 'chipmunk': vibratoLFO.frequency.value=6; vibratoDepth.value=0.005; bp.frequency.value=1800; bp.Q.value=1.2; hp.frequency.value=200; lp.frequency.value=8000; makeShaper(0.2); tremoloLFO.frequency.value=7; tremoloDepth.gain.value=0.15; break;
-        case 'demon': vibratoLFO.frequency.value=3; vibratoDepth.value=0.004; bp.frequency.value=600; bp.Q.value=1.2; hp.frequency.value=90; lp.frequency.value=3200; makeShaper(1.2); tremoloLFO.frequency.value=8; tremoloDepth.gain.value=0.12; break;
-        case 'radio': vibratoLFO.frequency.value=0; vibratoDepth.value=0.0; bp.frequency.value=1600; bp.Q.value=6; hp.frequency.value=300; lp.frequency.value=3000; makeShaper(0.5); tremoloLFO.frequency.value=0; tremoloDepth.gain.value=0.0; break;
-        case 'alien': vibratoLFO.frequency.value=10; vibratoDepth.value=0.006; bp.frequency.value=1400; bp.Q.value=0.9; hp.frequency.value=140; lp.frequency.value=6500; makeShaper(0.6); tremoloLFO.frequency.value=12; tremoloDepth.gain.value=0.25; break;
+        case 'chipmunk': shifter.parameters.get('pitch').setValueAtTime(1.7, ctx.currentTime); shifter.parameters.get('mix').setValueAtTime(1.0, ctx.currentTime); bp.frequency.value=1800; lp.frequency.value=9000; tremLFO.frequency.value=6; tremDepth.gain.value=0.15; makeCrusher(10); break;
+        case 'giant':    shifter.parameters.get('pitch').setValueAtTime(0.65, ctx.currentTime); shifter.parameters.get('mix').setValueAtTime(1.0, ctx.currentTime); bp.frequency.value=700;  lp.frequency.value=4200; tremLFO.frequency.value=4; tremDepth.gain.value=0.08; makeCrusher(9); break;
+        case 'robot':    shifter.parameters.get('pitch').setValueAtTime(1.0, ctx.currentTime); shifter.parameters.get('mix').setValueAtTime(0.0, ctx.currentTime); bp.frequency.value=1200; lp.frequency.value=4800; tremLFO.frequency.value=30; tremDepth.gain.value=0.6; makeCrusher(6); break;
+        case 'alien':    shifter.parameters.get('pitch').setValueAtTime(1.25, ctx.currentTime); shifter.parameters.get('mix').setValueAtTime(1.0, ctx.currentTime); bp.frequency.value=1400; lp.frequency.value=7000; tremLFO.frequency.value=11; tremDepth.gain.value=0.25; makeCrusher(9); break;
+        case 'radio':    shifter.parameters.get('pitch').setValueAtTime(1.0, ctx.currentTime); shifter.parameters.get('mix').setValueAtTime(0.0, ctx.currentTime); bp.frequency.value=1600; bp.Q.value=6; lp.frequency.value=3200; tremLFO.frequency.value=0; tremDepth.gain.value=0; makeCrusher(12); break;
+        case 'monster':  shifter.parameters.get('pitch').setValueAtTime(0.55, ctx.currentTime); shifter.parameters.get('mix').setValueAtTime(1.0, ctx.currentTime); bp.frequency.value=600;  lp.frequency.value=3600; tremLFO.frequency.value=8; tremDepth.gain.value=0.18; makeCrusher(7); break;
       }
     }
     return { input, output, setVoice };
   }
+
   function randomizeMySillies(trigger='auto'){ if(!local.maskMgr||!local.voiceChain) return; local.maskMgr.set(pickMask()); local.voiceChain.setVoice(pickVoiceType()); if(local.tileEl){ const badge=local.tileEl.querySelector('.badge'); badge.textContent=(trigger==='speak'?'✨ New Sillies!':'🎲 Shuffle!'); setTimeout(()=>badge.textContent='You',1200);} }
 
   // ---------- Local media ----------
@@ -338,7 +355,7 @@
     if (local.stream) return;
     local.audioCtx = new (window.AudioContext || window.webkitAudioContext)();
     await local.audioCtx.resume();
-    local.voiceChain = buildVoiceChain(local.audioCtx);
+    local.voiceChain = await buildVoiceChain(local.audioCtx);
     local.stream = await navigator.mediaDevices.getUserMedia({
       video:{ facingMode:'user', width:{ideal:640}, height:{ideal:360} },
       audio:{ echoCancellation:true, noiseSuppression:true, autoGainControl:true }
@@ -353,6 +370,7 @@
     const analyserSrc = local.audioCtx.createMediaStreamSource(local.processedAudioStream);
     local.vad = makeAnalyser(local.audioCtx, analyserSrc);
     local.vad.onSpeak = () => { if (sillyMode==='auto') randomizeMySillies('speak'); };
+    local.voiceChain.setVoice('chipmunk');
     setChaosTimer();
   }
   function stopLocal(){
@@ -400,7 +418,6 @@
     pcs.set(peerId, pc);
     await addTracksTo(pc);
     pc.onicecandidate = (ev)=>{ if(ev.candidate){ ws.send(JSON.stringify({type:'signal', target:peerId, data:{candidate:ev.candidate}})); } };
-    // Keep one stream object and add incoming tracks to it (fixes missing audio)
     let remoteStream = new MediaStream();
     pc.ontrack = (ev)=>{
       const track = ev.track;
@@ -476,7 +493,7 @@
   btnShuffle.onclick = ()=> randomizeMySillies('manual');
   selMode.onchange = ()=>{ sillyMode = selMode.value; setChaosTimer(); };
   fxToggle.onchange = ()=>{ useFX = fxToggle.checked; replaceAudioTrackOnAllPCs(); };
-  btnMute.onclick = ()=>{ local.muted = !local.muted; const at = chooseAudioTrack(); if (at) at.enabled = !local.muted; btnMute.textContent = local.muted ? 'Unmute' : 'Mute'; };
+  btnMute.onclick = ()=>{ const at = chooseAudioTrack(); if (at) { at.enabled = !at.enabled; btnMute.textContent = at.enabled ? 'Mute' : 'Unmute'; } };
   btnCamera.onclick = ()=>{ local.camOn = !local.camOn; const vt = local.stream?.getVideoTracks?.()[0]; if (vt) vt.enabled = local.camOn; btnCamera.textContent = local.camOn ? 'Camera' : 'Camera (off)'; };
   document.addEventListener('visibilitychange', ()=>{ if (document.visibilityState==='visible' && local.audioCtx) local.audioCtx.resume?.(); });
 })();
